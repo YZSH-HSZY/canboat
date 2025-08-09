@@ -22,6 +22,13 @@ limitations under the License.
 
 #include <parse.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <time.h>
+#include <stdlib.h>
+#define strtok_r(str, delim, saveptr) strtok_s(str, delim, saveptr)
+#endif
+
 static char *findOccurrence(char *msg, char c, int count)
 {
   int   i;

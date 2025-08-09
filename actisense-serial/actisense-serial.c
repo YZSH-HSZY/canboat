@@ -27,19 +27,68 @@ limitations under the License.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/wait.h>
-#include <termios.h>
+// #include <sys/time.h>
+// #include <sys/wait.h>
+// #include <termios.h>
 #include <time.h>
+
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <winbase.h>
+#include <sys/stat.h>
+#include <io.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <signal.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
+#endif
 
 #include "actisense.h"
 #include "common.h"
 #include "license.h"
 #include "parse.h"
 
+#ifdef _WIN32
+#define  B115200   CBR_115200
+#define  B19200	   CBR_19200
+#define  B57600    CBR_57600
+#define  B38400    CBR_38400
+#define STDIN_FD  ((int)GetStdHandle(STD_INPUT_HANDLE))
+#define strcasecmp _stricmp
+#define S_ISREG(mode) (((mode) & S_IFMT) == S_IFREG) 
+#define OPEN _open
+#define WRITE _write
+#define READ _read
+
+typedef unsigned int tcflag_t;
+typedef unsigned char	cc_t;
+typedef unsigned int	speed_t;
+#define NCCS 32
+struct termios {
+  tcflag_t c_iflag;		/* input mode flags */
+  tcflag_t c_oflag;		/* output mode flags */
+  tcflag_t c_cflag;		/* control mode flags */
+  tcflag_t c_lflag;		/* local mode flags */
+  cc_t c_line;			/* line discipline */
+  cc_t c_cc[NCCS];		/* control characters */
+  speed_t c_ispeed;		/* input speed */
+  speed_t c_ospeed;		/* output speed */
+} ;
+
+#else
+#define STDIN_FD  STDIN_FILENO
+#define OPEN open
+#define WRITE write
+#define READ read
+#endif
 /* The following startup command reverse engineered from Actisense NMEAreader.
  * It instructs the NGT1 to clear its PGN message TX list, thus it starts
  * sending all PGNs.
@@ -83,6 +132,10 @@ static void messageReceived(const unsigned char *msg, size_t msgLen);
 static void n2kMessageReceived(const unsigned char *msg, size_t msgLen, unsigned char command);
 static void ngtMessageReceived(const unsigned char *msg, size_t msgLen);
 
+void exit_clear() {
+  WSACleanup();
+}
+
 int main(int argc, char **argv)
 {
   int            handle;
@@ -93,6 +146,16 @@ int main(int argc, char **argv)
   int            speed = 115200;
   int            i;
   time_t         lastPing = time(0);
+
+#ifdef _WIN32
+  WSADATA wsaData;
+  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+      printf("WSAStartup failed\n");
+      return -1;
+  }
+
+  atexit(exit_clear);
+#endif
 
   setProgName(argv[0]);
   while (argc > 1)
@@ -141,9 +204,9 @@ int main(int argc, char **argv)
         case 115200:
           baudRate = B115200;
           break;
-        case 230400:
-          baudRate = B230400;
-          break;
+        // case 230400:
+        //   baudRate = B230400;
+        //   break;
 #ifdef B460800
         case 460800:
           baudRate = B460800;
@@ -215,35 +278,37 @@ int main(int argc, char **argv)
   }
 
   logDebug("Opening %s\n", device);
-  if (strncmp(device, "tcp:", STRSIZE("tcp:")) == 0)
-  {
-    handle = open_socket_stream(device);
-    logDebug("socket = %d\n", handle);
-    isFile = true;
-    if (handle < 0)
-    {
-      fprintf(stderr, "Cannot open NGT-1-A TCP stream %s\n", device);
-      exit(1);
-    }
-  }
-  else
-  {
-    int oflag = O_NOCTTY | O_NONBLOCK;
+  // if (strncmp(device, "tcp:", STRSIZE("tcp:")) == 0)
+  // {
+  //   handle = open_socket_stream(device);
+  //   logDebug("socket = %d\n", handle);
+  //   isFile = true;
+  //   if (handle < 0)
+  //   {
+  //     fprintf(stderr, "Cannot open NGT-1-A TCP stream %s\n", device);
+  //     exit(1);
+  //   }
+  // }
+  // else
+  // {
+    // int oflag = O_NOCTTY | O_NONBLOCK;
+    // int oflag = _O_RDWR | _O_BINARY;
+    int oflag = 0;
 
     if (writeonly)
     {
       oflag |= O_WRONLY;
       oflag |= O_CREAT;
     }
-    else if (readonly)
-    {
-      oflag |= O_RDONLY;
-    }
-    else
-    {
-      oflag |= O_RDWR;
-    }
-    handle = open(device, oflag, 0777);
+  //   else if (readonly)
+  //   {
+  //     oflag |= O_RDONLY;
+  //   }
+  //   else
+  //   {
+  //     oflag |= O_RDWR;
+  //   }
+    handle = OPEN(device, oflag, 0777);
 
     logDebug("fd = %d\n", handle);
     if (handle < 0)
@@ -255,7 +320,7 @@ int main(int argc, char **argv)
       logAbort("Cannot determine status of %s\n", device);
     }
     isFile = S_ISREG(statbuf.st_mode);
-  }
+  // }
 
   if (isFile)
   {
@@ -269,59 +334,60 @@ int main(int argc, char **argv)
       logDebug("Device is a normal file, do not set the attributes.\n");
     }
   }
-  else
-  {
-    logDebug("Device is a serial port, set the attributes.\n");
+  // else
+  // {
+  //   logDebug("Device is a serial port, set the attributes.\n");
 
-    memset(&attr, 0, sizeof(attr));
-    if (cfsetspeed(&attr, baudRate) < 0)
-    {
-      logAbort("Could not set baudrate %d\n", speed);
-    }
-    attr.c_cflag |= CS8 | CLOCAL | CREAD;
+  //   memset(&attr, 0, sizeof(attr));
+  //   if (cfsetspeed(&attr, baudRate) < 0)
+  //   {
+  //     logAbort("Could not set baudrate %d\n", speed);
+  //   }
+  //   attr.c_cflag |= CS8 | CLOCAL | CREAD;
 
-    attr.c_iflag |= IGNPAR;
-    attr.c_cc[VMIN]  = 1;
-    attr.c_cc[VTIME] = 0;
-    tcflush(handle, TCIFLUSH);
-    tcsetattr(handle, TCSANOW, &attr);
+  //   attr.c_iflag |= IGNPAR;
+  //   attr.c_cc[VMIN]  = 1;
+  //   attr.c_cc[VTIME] = 0;
+  //   tcflush(handle, TCIFLUSH);
+  //   tcsetattr(handle, TCSANOW, &attr);
 
-    logDebug("Device is a serial port, send the startup sequence.\n");
+  //   logDebug("Device is a serial port, send the startup sequence.\n");
 
-    writeMessage(handle, NGT_MSG_SEND, NGT_STARTUP_SEQ, sizeof(NGT_STARTUP_SEQ), UINT64_C(0));
-    sleep(2);
-  }
+  //   writeMessage(handle, NGT_MSG_SEND, NGT_STARTUP_SEQ, sizeof(NGT_STARTUP_SEQ), UINT64_C(0));
+  //   sleep(2);
+  // }
 
-  if (!isFile)
-  {
-    // Do not read anything until we have seen 10 messages on bus
-    for (i = 0; i < 10;)
-    {
-      int r = isReady(handle, INVALID_SOCKET, INVALID_SOCKET, timeout);
+  // if (!isFile)
+  // {
+  //   // Do not read anything until we have seen 10 messages on bus
+  //   for (i = 0; i < 10;)
+  //   {
+  //     int r = isReady(handle, INVALID_SOCKET, INVALID_SOCKET, timeout);
 
-      if ((r & FD1_ReadReady) > 0)
-      {
-        if (readNGT1(handle) <= 0)
-        {
-          break;
-        }
-        i++;
-      }
-    }
-  }
+  //     if ((r & FD1_ReadReady) > 0)
+  //     {
+  //       if (readNGT1(handle) <= 0)
+  //       {
+  //         break;
+  //       }
+  //       i++;
+  //     }
+  //   }
+  // }
 
   for (;;)
   {
     char msg[BUFFER_SIZE];
-    int  r = isReady(writeonly ? INVALID_SOCKET : handle, readonly ? INVALID_SOCKET : STDIN_FILENO, INVALID_SOCKET, timeout);
+    // int  r = isReady(writeonly ? INVALID_SOCKET : handle, readonly ? INVALID_SOCKET : STDIN_FD, INVALID_SOCKET, timeout);
 
-    if ((r & FD1_ReadReady) > 0)
-    {
-      if (readNGT1(handle) <= 0)
-      {
-        break;
-      }
-    }
+    // if ((r & FD1_ReadReady) > 0)
+    // {
+    //   if (readNGT1(handle) <= 0)
+    //   {
+    //     break;
+    //   }
+    // }
+    int r = 2;
     if ((r & FD2_ReadReady) > 0)
     {
       if (!readIn())
@@ -508,7 +574,7 @@ static void writeMessage(int handle, unsigned char command, const unsigned char 
   int written;
   do
   {
-    written = write(handle, r, needs_written);
+    written = WRITE(handle, r, needs_written);
     if (written != -1)
     {
       r += written;
@@ -549,8 +615,10 @@ static bool readIn(void)
   unsigned char buf[BUFFER_SIZE];
   ssize_t       r;
 
-  r = read(STDIN_FILENO, buf, sizeof(buf));
-
+  // r = read(STDIN_FD, buf, sizeof(buf));
+  #define TEST_STR "2025-08-08-08:35:49.125,7,126993,21,255,8,60,ac,cf,ff,ff,0f,a0,c0\n"
+  memcpy(buf, TEST_STR, strlen(TEST_STR) + 1);
+  r = strlen(TEST_STR) + 1;
   if (r <= 0)
   {
     if (!isFile)

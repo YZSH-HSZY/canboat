@@ -33,11 +33,13 @@ limitations under the License.
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
+
+// #include <unistd.h>
+#define ssize_t long int 
 
 #include "license.h"
 
-#ifndef WIN32
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>

@@ -20,6 +20,23 @@ limitations under the License.
 
 #include "common.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <time.h>
+#include <stdlib.h>
+void usleep(unsigned int usec) {
+    Sleep(usec / 1000);  // Windows 下用 Sleep（毫秒级）
+}
+
+struct tm *localtime_r(const time_t *timep, struct tm *result) {
+    return localtime_s(result, timep) == 0 ? result : NULL;
+}
+#define strtok_r(str, delim, saveptr) strtok_s(str, delim, saveptr)
+time_t timegm(struct tm *tm) {
+    return _mkgmtime(tm); // Windows 使用 _mkgmtime
+}
+#endif
+
 StringBuffer sbNew;
 
 static const char *logLevels[] = {"FATAL", "ERROR", "INFO", "DEBUG"};
@@ -37,7 +54,18 @@ uint64_t getNow(void)
   {
     return UINT64_C(1672527600000); // 2023-01-01 00:00
   }
-
+#ifdef _WIN32
+  FILETIME ft;
+  ULARGE_INTEGER uli;
+  GetSystemTimePreciseAsFileTime(&ft);
+  uli.LowPart = ft.dwLowDateTime;
+  uli.HighPart = ft.dwHighDateTime;
+  // 1601-01-01 --> 1970-01-01
+  uli.QuadPart -= 116444736000000000ULL;
+  tv.tv_sec = uli.QuadPart / 10000000ULL;
+  tv.tv_usec = (uli.QuadPart % 10000000ULL) / 10ULL;
+  return (uint64_t)tv.tv_sec * 1000L + (uint64_t)tv.tv_usec;
+#else
   if (gettimeofday(&tv, (void *) 0) == 0)
   {
     uint64_t t    = tv.tv_sec;
@@ -45,6 +73,7 @@ uint64_t getNow(void)
 
     return t * 1000L + msec;
   }
+#endif
   return 0L;
 }
 
@@ -68,7 +97,11 @@ const char *fmtTimestamp(char str[DATE_LENGTH], uint64_t when)
 
     t    = when / 1000L;
     msec = when % 1000L;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
     gmtime_r(&t, &tm);
+#endif
     strftime(str, DATE_LENGTH - 5, "%Y-%m-%dT%H:%M:%S", &tm);
     len = strlen(str);
     snprintf(str + len, DATE_LENGTH - len, ".%3.3dZ", msec);
@@ -255,7 +288,7 @@ void sbDelete(StringBuffer *sb, size_t start, size_t end)
   }
 }
 
-void sbAppendData(StringBuffer *sb, const void *data, size_t len)
+void sbAppendData(StringBuffer *sb, const char *data, size_t len)
 {
   sbEnsureCapacity(sb, sb->len + len);
   memcpy(sb->data + sb->len, data, len);
@@ -268,7 +301,7 @@ char hexDigit(uint8_t b)
   return (b > 9) ? (char) b + 'a' - 10 : (char) b + '0';
 }
 
-void sbAppendEncodeHex(StringBuffer *sb, const void *data, size_t len, char separator)
+void sbAppendEncodeHex(StringBuffer *sb, const char *data, size_t len, char separator)
 {
   sbEnsureCapacity(sb, sb->len + len * 3);
 
@@ -852,21 +885,25 @@ int isReady(SOCKET fd1, SOCKET fd2, SOCKET fd3, int timeout)
 
   FD_ZERO(&fds);
   FD_ZERO(&fdw);
-  if (fd1 > INVALID_SOCKET)
+  if (fd1 != INVALID_SOCKET)
   {
     FD_SET(fd1, &fds);
   }
-  if (fd2 > INVALID_SOCKET)
+  if (fd2 != INVALID_SOCKET)
   {
     FD_SET(fd2, &fds);
   }
-  if (fd3 > INVALID_SOCKET)
+  if (fd3 != INVALID_SOCKET)
   {
     FD_SET(fd3, &fdw);
   }
   waitfor.tv_sec  = timeout ? timeout : 10;
   waitfor.tv_usec = 0;
+#ifdef _WIN32
+  setsize         = CB_MIN(CB_MIN(fd1, fd2), fd3) + 1;
+#else
   setsize         = CB_MAX(CB_MAX(fd1, fd2), fd3) + 1;
+#endif
   r               = select(setsize, &fds, &fdw, 0, &waitfor);
   if (r < 0)
   {
@@ -874,15 +911,15 @@ int isReady(SOCKET fd1, SOCKET fd2, SOCKET fd3, int timeout)
   }
   if (r > 0)
   {
-    if (fd1 > INVALID_SOCKET && FD_ISSET(fd1, &fds))
+    if (fd1 != INVALID_SOCKET && FD_ISSET(fd1, &fds))
     {
       ret |= FD1_ReadReady;
     }
-    if (fd2 > INVALID_SOCKET && FD_ISSET(fd2, &fds))
+    if (fd2 != INVALID_SOCKET && FD_ISSET(fd2, &fds))
     {
       ret |= FD2_ReadReady;
     }
-    if (fd3 > INVALID_SOCKET && FD_ISSET(fd3, &fdw))
+    if (fd3 != INVALID_SOCKET && FD_ISSET(fd3, &fdw))
     {
       ret |= FD3_WriteReady;
     }
