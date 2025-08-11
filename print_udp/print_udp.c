@@ -21,8 +21,8 @@
 #define SERIAL_TYPE int
 #endif
 
-#define USE_KC2W_PC_DST_UDP_PORT 9998
-#define ACTISENCE_PAIR_COM_NAME "COM9"
+#define USE_KC2W_PC_DST_UDP_PORT 9999
+#define ACTISENCE_PAIR_COM_NAME "COM4"
 
 #ifndef TYPE_U32
    typedef unsigned int          U32;
@@ -111,6 +111,15 @@ void close_serial(HANDLE hUART)
 }
 #endif
 
+static char HEX_STR_BUFFER[1024] = {0};
+static const char* bytes_to_hex(const char* bytes, size_t len) {
+  memset(HEX_STR_BUFFER, 0, sizeof(HEX_STR_BUFFER));
+  for (size_t i = 0; i < len; ++i) {
+    snprintf(HEX_STR_BUFFER + 2 * i, 3, "%02x", (unsigned char)bytes[i]);
+  }
+  return HEX_STR_BUFFER;
+}
+
 static size_t writeUint64(uint64_t v, unsigned char *buf)
 {
   size_t out = 0;
@@ -194,6 +203,7 @@ static void writeMessage(SERIAL_TYPE handle, unsigned char command, const unsign
   int written;
   do
   {
+    logDebug("Trying to write bytes %s\n", bytes_to_hex((const char *)r, needs_written));
     written = WRITE(handle, r, needs_written);
     if (written != -1)
     {
@@ -300,9 +310,51 @@ bool valid_kc2w_udp_frame(const unsigned char *msg, size_t msgLen) {
   return true;
 }
 
+void get_current_time_formatted(char *buffer, size_t buffer_size) {
+    SYSTEMTIME st;
+    GetLocalTime(&st); // get local current time(unit ms)
+
+    // YYYY-MM-DD-HH:MM:SS.mmm
+    snprintf(buffer, buffer_size, 
+             "%04d-%02d-%02d-%02d:%02d:%02d.%03d",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond,
+             st.wMilliseconds);
+}
+
 void handle_one_frame(SERIAL_TYPE handle, const unsigned char *msg, size_t msgLen) {
   if (!valid_kc2w_udp_frame(msg, msgLen)) return;
+
+  stEthCanFrame rev;
+  memcpy(&rev, msg, sizeof(stEthCanFrame));
+  // "2025-08-08-08:35:49.125,7,126993,21,255,8,60,ac,cf,ff,ff,0f,a0,c0\n"
+  char analyzer_str[1024] = {0};
+  unsigned int pri = 0;
+  unsigned int src = 0;
+  unsigned int dst = 255;
+  unsigned int pgn = 0;
+
+//   <0x18eeff01> [8] 05 a0 be 1c 00 a0 a0 c0 
+// 2025-08-11-08:14:49.622,6,60928,1,255,8,05,a0,be,1c,00,a0,a0,c0
+
+  get_current_time_formatted(analyzer_str, sizeof(analyzer_str));
+  getISO11783BitsFromCanId(rev.id, &pri, &pgn, &src, &dst);
+  size_t len = strlen(analyzer_str);
+  sprintf(analyzer_str + len, ",%d,%d,%d,%d,%d", pri, pgn, src, dst, rev.len);
+  len = strlen(analyzer_str);
   
+  for (int i = 0; i < rev.len; i++)
+  {
+    if(i >= sizeof(rev.buf)/sizeof(rev.buf[0])) {
+      printf("too long data, only print first %lld bytes\n", sizeof(rev.buf)/sizeof(rev.buf[0]));
+      break;
+    }
+    sprintf(analyzer_str + len, ",%02x", (int)rev.buf[i]);
+    len += 3;
+    analyzer_str[len] = '\0';
+  }
+
+  parseAndWriteIn(handle, (const char *)&analyzer_str);
 }
 
 int main(int argc, char **argv) {
@@ -342,7 +394,7 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    
+    setLogLevel(LOGLEVEL_DEBUG);
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(USE_KC2W_PC_DST_UDP_PORT);
@@ -380,7 +432,7 @@ int main(int argc, char **argv) {
             break;
         }
         buf[n] = 0;
-        printf("from %s:%d: %s\n", inet_ntoa(dst_addr.sin_addr), ntohs(dst_addr.sin_port), buf);
+        printf("from %s:%d: len=%d\n", inet_ntoa(dst_addr.sin_addr), ntohs(dst_addr.sin_port), n);
         handle_one_frame(handle, (const unsigned char *)buf, n);
     }
 
