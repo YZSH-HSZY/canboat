@@ -21,7 +21,7 @@ set(COMMON_HEADERS
 )
 
 add_library(common STATIC ${COMMON_SOURCES} ${COMMON_HEADERS})
-target_include_directories(common PUBLIC . common)
+target_include_directories(common PRIVATE . common)
 
 set(ACTISENSE-SERIAL_SOURCES
     actisense-serial/actisense-serial.c
@@ -30,6 +30,7 @@ set(ACTISENSE-SERIAL_SOURCES
 
 add_executable(actisense-serial ${ACTISENSE-SERIAL_SOURCES})
 target_link_libraries(actisense-serial common)
+target_include_directories(actisense-serial PRIVATE common)
 
 set(PRINT_UDP_SOURCES
     print_udp/print_udp.c
@@ -37,3 +38,6 @@ set(PRINT_UDP_SOURCES
 
 add_executable(print_udp ${PRINT_UDP_SOURCES})
 target_link_libraries(print_udp common)
+target_include_directories(print_udp PRIVATE common)
+# target_include_directories(print_udp PUBLIC analyzer)
+
