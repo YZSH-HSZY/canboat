@@ -32,7 +32,7 @@
 
 #ifdef _WIN32
 #define ERROR_PRINT(str_info) printf(str_info ":%d\n", WSAGetLastError());
-#define SOCKET_CLOSE(sock) {if(sock != INVALID_SOCKET) closesocket(sock); WSACleanup();}
+#define SOCKET_CLOSE(sock) {if(sock != INVALID_SOCKET) closesocket(sock); sock = INVALID_SOCKET;}
 #else
 #define ERROR_PRINT(str_info) perror(str_info);
 #define SOCKET_CLOSE(sock) close(sock);
@@ -74,9 +74,9 @@ HANDLE open_serial(LPTSTR pzName, DWORD dwBaudRate, BYTE biDataBits, BYTE biStop
   wsprintf(szPortName,_T("\\\\.\\%s"),pzName);
   
 	hUART = CreateFile(szPortName,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,0,NULL);
-	if((hUART==INVALID_HANDLE_VALUE)||(hUART==NULL))
+	if((hUART==INVALID_HANDLE_VALUE))
 	{
-		return NULL;
+		return INVALID_HANDLE_VALUE;
 	}
 	
 	GetCommState(hUART, &dcb);
@@ -108,7 +108,8 @@ DWORD  WRITE(HANDLE hUART, void* pData, DWORD dwLen)
 }
 void close_serial(HANDLE hUART)
 {
-	CloseHandle(hUART);
+	if(hUART != INVALID_HANDLE_VALUE) CloseHandle(hUART);
+  hUART = INVALID_HANDLE_VALUE;
 }
 #endif
 
@@ -818,12 +819,73 @@ void handle_one_frame(SERIAL_TYPE handle, const unsigned char *msg, size_t msgLe
   parseAndWriteIn(handle, (const char *)&analyzer_str);
 }
 
-static char VIRTUAL_COM_NAME[32] = "COM4";
-static int VIRTUAL_COM_BAUD = 115200;
-static int KC2W_PC_DST_UDP_PORT = 9999;
+static bool ENABLE_READER = false;
+static char VIRTUAL_PAIR_READER_COM_NAME[32] = "COM4";
+static int VIRTUAL_PAIR_READER_COM_BAUD = 115200;
+static int KC2W_PC_SEND_UDP_PORT = 9999;
+static SOCKET reader_socket = INVALID_SOCKET;
+static SERIAL_TYPE reader_handle = INVALID_HANDLE_VALUE;
+static struct sockaddr_in reader_addr = {0};
+
+static bool ENABLE_SIMULATOR = false;
+static char VIRTUAL_PAIR_SIMULATOR_COM_NAME[32] = "COM22";
+static int VIRTUAL_PAIR_SIMULATOR_COM_BAUD = 115200;
+static int KC2W_PC_RECV_UDP_PORT = 8888;
+static SOCKET simulator_socket = INVALID_SOCKET;
+static SERIAL_TYPE simulator_handle = INVALID_HANDLE_VALUE;
+static struct sockaddr_in simulator_addr = {0};
 
 // load config, format:
-// COM4,4800,9999
+// READ,COM4,4800,9999
+// WRITE,COM22,4800,8888
+void load_reader_config(char* line) {
+  if (!line || strlen(line) < 5) return;
+  if (strncmp(line, "READ,", 5) != 0) return;
+  ENABLE_READER = true;
+  line += 5;
+  char *token = strtok(line, ",");
+  if (token != NULL) {
+    strcpy(VIRTUAL_PAIR_READER_COM_NAME, token);
+    token = strtok(NULL, ",");
+    if (token != NULL) {
+      int baud = atoi(token);
+      if (baud > 0) {
+        VIRTUAL_PAIR_READER_COM_BAUD = baud;
+      }
+    }
+    token = strtok(NULL, ",");
+    if (token != NULL) {
+      int port = atoi(token);
+      if (port > 0) {
+        KC2W_PC_SEND_UDP_PORT = port;
+      }
+    }
+  }
+}
+void load_simulator_config(char* line) {
+  if (!line || strlen(line) < 6) return;
+  if (strncmp(line, "WRITE,", 6) != 0) return;
+  ENABLE_SIMULATOR = true;
+  line += 6;
+  char *token = strtok(line, ",");
+  if (token != NULL) {
+    strcpy(VIRTUAL_PAIR_SIMULATOR_COM_NAME, token);
+    token = strtok(NULL, ",");
+    if (token != NULL) {
+      int baud = atoi(token);
+      if (baud > 0) {
+        VIRTUAL_PAIR_SIMULATOR_COM_BAUD = baud;
+      }
+    }
+    token = strtok(NULL, ",");
+    if (token != NULL) {
+      int port = atoi(token);
+      if (port > 0) {
+        KC2W_PC_RECV_UDP_PORT = port;
+      }
+    }
+  }
+}
 void load_config(char* file_path) {
   FILE *fp = fopen(file_path, "r");
   if (fp == NULL) {
@@ -833,44 +895,100 @@ void load_config(char* file_path) {
 
   char line[1024];
   while (fgets(line, sizeof(line), fp)) {
-    char *token = strtok(line, ",");
-    if (token != NULL) {
-      strcpy(VIRTUAL_COM_NAME, token);
-      token = strtok(NULL, ",");
-      if (token != NULL) {
-        int baud = atoi(token);
-        if (baud > 0) {
-          VIRTUAL_COM_BAUD = baud;
-        }
-      }
-      token = strtok(NULL, ",");
-      if (token != NULL) {
-        int port = atoi(token);
-        if (port > 0) {
-          KC2W_PC_DST_UDP_PORT = port;
-        }
-      }
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+      continue;
     }
+    load_reader_config(line);
+    load_simulator_config(line);
   }
 
   fclose(fp);
 }
 
+bool reader_prepare() {
+  reader_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (reader_socket == INVALID_SOCKET) {
+      ERROR_PRINT("socket failed with error");
+      return false;
+  }
+  reader_handle = open_serial(VIRTUAL_PAIR_READER_COM_NAME, VIRTUAL_PAIR_READER_COM_BAUD, 8, 1, 0);
+  if (reader_handle == INVALID_HANDLE_VALUE) {
+      ERROR_PRINT("open_serial failed");
+      SOCKET_CLOSE(reader_socket);
+      return false;
+  }
+
+  reader_addr.sin_family = AF_INET;
+  reader_addr.sin_port = htons(KC2W_PC_SEND_UDP_PORT);
+  reader_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if(bind(reader_socket, (struct sockaddr *)&reader_addr, sizeof(reader_addr)) < 0){
+      ERROR_PRINT("bind");
+      SOCKET_CLOSE(reader_socket);
+      close_serial(reader_handle);
+      return false;
+  }
+  return true;
+}
+
+bool simulator_prepare() {
+  simulator_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (simulator_socket == INVALID_SOCKET) {
+      ERROR_PRINT("socket failed with error");
+      return false;
+  }
+  simulator_handle = open_serial(VIRTUAL_PAIR_SIMULATOR_COM_NAME, VIRTUAL_PAIR_SIMULATOR_COM_BAUD, 8, 1, 0);
+  if (simulator_handle == INVALID_HANDLE_VALUE) {
+      ERROR_PRINT("open_serial failed\n");
+      SOCKET_CLOSE(simulator_socket);
+      return false;
+  }
+
+  simulator_addr.sin_family = AF_INET;
+  simulator_addr.sin_port = htons(KC2W_PC_RECV_UDP_PORT);
+  simulator_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  return true;
+}
+
+// bool simulator_data_write(void* data, int len, int timeOutMs) {
+//   fd_set   s_set;
+//   int      ret;
+//   struct timeval  tv = { 0, timeOutMs * 1000 };
+//   FD_ZERO(&s_set);
+//   FD_SET(sockForTx, &s_set);
+// }
+
 int main(int argc, char **argv) {
     printf("hello, load config from config.txt\n");
     load_config("config.txt");
-    printf("Config Virtual COM name: %s\n", VIRTUAL_COM_NAME);
-    printf("Config Virtual COM baud: %d\n", VIRTUAL_COM_BAUD);
-    printf("Config KC2W PC DST UDP port name: %d\n", KC2W_PC_DST_UDP_PORT);
-#ifndef _WIN32
-    signal(SIGSEGV, global_clear);
-    signal(SIGINT, global_clear);
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if(sock < 0){
-        perror("socket");
-        return 1;
+    
+    if (!ENABLE_READER && !ENABLE_SIMULATOR) {
+      printf("no way use in config, program exit!\n");
+      return 0;
     }
+    if(ENABLE_READER) {
+      printf("--------------reader config--------------\n");
+      printf("Config Virtual COM name: %s\n", VIRTUAL_PAIR_READER_COM_NAME);
+      printf("Config Virtual COM baud: %d\n", VIRTUAL_PAIR_READER_COM_BAUD);
+      printf("Config KC2W PC DST UDP port name: %d\n", KC2W_PC_SEND_UDP_PORT);
+    }
+
+    if(ENABLE_SIMULATOR) {
+      printf("--------------simulator config--------------\n");
+      printf("Config Virtual COM name: %s\n", VIRTUAL_PAIR_SIMULATOR_COM_NAME);
+      printf("Config Virtual COM baud: %d\n", VIRTUAL_PAIR_SIMULATOR_COM_BAUD);
+      printf("Config KC2W PC SRC UDP port name: %d\n", KC2W_PC_RECV_UDP_PORT);
+    }
+#ifndef _WIN32
+    // signal(SIGSEGV, global_clear);
+    // signal(SIGINT, global_clear);
+
+    // int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    // if(sock < 0){
+    //     perror("socket");
+    //     return 1;
+    // }
 #else
     if (!SetConsoleCtrlHandler(global_clear, TRUE)) {
         printf("set console signal handler failed\n");
@@ -881,65 +999,96 @@ int main(int argc, char **argv) {
         printf("WSAStartup failed\n");
         return 1;
     }
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
-        printf("socket failed with error: %d\n", WSAGetLastError());
-        WSACleanup();
-        return 1;
-    }
-    SERIAL_TYPE handle = open_serial(VIRTUAL_COM_NAME, VIRTUAL_COM_BAUD, 8, 1, 0);
-    if (handle == NULL) {
-        printf("open_serial failed\n");
-        closesocket(sock);
-        WSACleanup();
-        return 1;
-    }
 #endif
 
     setLogLevel(LOGLEVEL_DEBUG);
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(KC2W_PC_DST_UDP_PORT);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if(bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0){
-        ERROR_PRINT("bind");
-        SOCKET_CLOSE(sock);
-        return 1;
+    int reader_init = 0, simulator_init = 0;
+    if (ENABLE_READER) reader_init = reader_prepare();
+    if (ENABLE_SIMULATOR) simulator_init = simulator_prepare();
+
+    if ((ENABLE_READER && !reader_init) || (ENABLE_SIMULATOR && !simulator_init)) {
+      ERROR_PRINT("prepare failed");
+      close_serial(reader_handle);
+      close_serial(simulator_handle);
+      SOCKET_CLOSE(reader_socket);
+      SOCKET_CLOSE(simulator_socket);
+      WSACleanup();
+      return 1;
     }
-    
-    fd_set fds;
-    struct timeval tv = {0, 200};
+
+    HANDLE waitHandles[2];
+    int waitHandlesCount = 0;
+    WSAEVENT sockEvent = WSACreateEvent();
+    if(ENABLE_READER) {
+      WSAEventSelect(reader_socket, sockEvent, FD_READ | FD_CLOSE);
+      waitHandles[waitHandlesCount++] = sockEvent;
+    }
+    OVERLAPPED ov = {0};
+    char comBuf[1024];
+    if(ENABLE_SIMULATOR) {
+      ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+      ReadFile(simulator_handle, comBuf, sizeof(comBuf), NULL, &ov);
+      waitHandles[waitHandlesCount++] = ov.hEvent;
+    }
 
     while(RUN_SIGN) {
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
+      // DWORD result = WaitForMultipleObjects(waitHandlesCount, waitHandles, FALSE, INFINITE);
+      DWORD result = WaitForMultipleObjects(waitHandlesCount, waitHandles, FALSE, 200);
+      if(waitHandlesCount == 1 && ENABLE_SIMULATOR && result == WAIT_OBJECT_0) {
+        result = WAIT_OBJECT_0 + 1;
+      }
+      switch (result) {
+        case WAIT_OBJECT_0:
+          WSANETWORKEVENTS events;
+          WSAEnumNetworkEvents(reader_socket, sockEvent, &events);
+          if (events.lNetworkEvents & FD_READ) {
+              // read socket data
+              char buf[1024];
+              struct sockaddr_in dst_addr;
+              socklen_t len = sizeof(dst_addr);
+              int n = recvfrom(reader_socket, buf, sizeof(buf), 0, (struct sockaddr *)&dst_addr, &len);
+              if(n > 0) {
+                buf[n] = '\0';
+                printf("from %s:%d: len=%d\n", inet_ntoa(dst_addr.sin_addr), ntohs(dst_addr.sin_port), n);
+                handle_one_frame(reader_handle, (const unsigned char *)buf, n);
+              }
+          }
+        break;
         
-        int ret = select(sock + 1, &fds, NULL, NULL, &tv);
+        case WAIT_OBJECT_0 + 1:
+          DWORD bytesRead;
+          GetOverlappedResult(simulator_handle, &ov, &bytesRead, TRUE);
+          // handle serial data
+          if (bytesRead > 0) {
+            printf("simulator data: %s\n", comBuf);
+          }
+          memset(comBuf, 0, sizeof(comBuf));
+          ReadFile(simulator_handle, comBuf, sizeof(comBuf), NULL, &ov);
+          break;
+        
+      case WAIT_FAILED:
+          ERROR_PRINT("WaitForMultipleObjects failed");
+          break;
+      }
 
-        if(ret < 0){
-            ERROR_PRINT("select failed with error");
-            break;
-        }
-        else if(ret == 0){
-            continue;
-        }
-
-        char buf[1024];
-        struct sockaddr_in dst_addr;
-        socklen_t len = sizeof(dst_addr);
-        int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&dst_addr, &len);
-        if(n < 0){
-            ERROR_PRINT("recvfrom failed with error");
-            break;
-        }
-        buf[n] = 0;
-        printf("from %s:%d: len=%d\n", inet_ntoa(dst_addr.sin_addr), ntohs(dst_addr.sin_port), n);
-        handle_one_frame(handle, (const unsigned char *)buf, n);
+        // char buf[1024];
+        // struct sockaddr_in dst_addr;
+        // socklen_t len = sizeof(dst_addr);
+        // int n = recvfrom(reader_sock, buf, sizeof(buf), 0, (struct sockaddr *)&dst_addr, &len);
+        // if(n < 0){
+        //     ERROR_PRINT("recvfrom failed with error");
+        //     break;
+        // }
+        // buf[n] = 0;
+        // printf("from %s:%d: len=%d\n", inet_ntoa(dst_addr.sin_addr), ntohs(dst_addr.sin_port), n);
+        // handle_one_frame(reader_handle, (const unsigned char *)buf, n);
     }
 
-    SOCKET_CLOSE(sock);
-    close_serial(handle);
+    SOCKET_CLOSE(reader_socket);
+    close_serial(reader_handle);
+    SOCKET_CLOSE(simulator_socket);
+    close_serial(simulator_handle);
     printf("bye\n");
 
     return 0;
