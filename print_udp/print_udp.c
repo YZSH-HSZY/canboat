@@ -39,7 +39,8 @@
 #endif
 
 static int RUN_SIGN = 1;
-static bool     isEBL;
+static bool     isEBL = false;
+static bool     isFile = false;
 
 typedef struct{
     U32     validCheck1;   // 0xAAAAAAAA
@@ -574,7 +575,7 @@ static void parseAndWriteIn(SERIAL_TYPE handle, const char *cmd)
   unsigned int dst;
   unsigned int bytes;
 
-  char        *p;
+  const char   *p;
   int          i;
   int          b;
   unsigned int byt;
@@ -835,6 +836,432 @@ static SOCKET simulator_socket = INVALID_SOCKET;
 static SERIAL_TYPE simulator_handle = INVALID_HANDLE_VALUE;
 static struct sockaddr_in simulator_addr = {0};
 
+// #define SIMULATOR_BUFFER_SIZE 4096
+// static struct RingBuffer {
+//   uint8_t buf[SIMULATOR_BUFFER_SIZE];
+//   uint32_t head = 0;
+//   uint32_t tail = 0;
+// } in_simulator_buffer;
+
+// #define SIMULATOR_BUFFER_IS_FULL ( \
+//   ((in_simulator_buffer.tail + SIMULATOR_BUFFER_SIZE - in_simulator_buffer.head) \
+//   % SIMULATOR_BUFFER_SIZE) == SIMULATOR_BUFFER_SIZE - 1)
+
+// #define SIMULATOR_BUFFER_IS_EMPTY (in_simulator_buffer.head == in_simulator_buffer.tail)
+// #define SIMULATOR_BUFFER_OP_SIZE (SIMULATOR_BUFFER_IS_FULL ? \
+//   0 : SIMULATOR_BUFFER_SIZE - 1 - (\
+//     (SIMULATOR_BUFFER_SIZE + in_simulator_buffer.tail - in_simulator_buffer.head) % \
+//     SIMULATOR_BUFFER_SIZE))
+// #define SIMULATOR_BUFFER_EXPAND(x) {in_simulator_buffer.tail += x; if(in_simulator_buffer.tail >= SIMULATOR_BUFFER_SIZE) in_simulator_buffer.tail = 0;}
+
+static StringBuffer inBuffer;
+
+const char* find_substr(const char *haystack, size_t haystack_len,
+             const char *needle, size_t needle_len
+) {
+  if (needle_len == 0) return haystack;
+  if (haystack_len < needle_len) return NULL;
+  
+  const char *h = haystack;
+  const char *n = needle;
+  
+  for (size_t i = 0; i <= haystack_len - needle_len; i++) {
+      if (memcmp(&h[i], n, needle_len) == 0) {
+          return &h[i];
+      }
+  }
+  return NULL;
+}
+
+static void simulator_send_frame(stEthCanFrame *frame, SOCKET socket)
+{
+  frame->validCheck1 = 0xaaaaaaaa;
+  frame->validCheck2 = 0xaaaaaaaa;
+  if (sendto(socket, (const char*)frame, sizeof(stEthCanFrame), 
+  0, (struct sockaddr*)&simulator_addr, sizeof(simulator_addr)) != sizeof(stEthCanFrame)
+) {
+    ERROR_PRINT("simulator write");
+  }
+}
+
+/*
+  See pgn.h for n2k fast packet data format
+*/
+static void simulator_send_fast_packet(RawMessage *msg, stEthCanFrame *frame, SOCKET socket)
+{
+  int index              = 0;
+  int remainingDataBytes = msg->len;
+  while (remainingDataBytes > 0)
+  {
+    frame->buf[0]
+        = index; // fast packet index (increases by 1 for every CAN frame), 'order' (the 3 uppermost bits) is left as 0 for now
+
+    if (index == 0) // 1st frame
+    {
+      frame->buf[1] = msg->len;             // fast packet payload size
+      memcpy(frame->buf + 2, msg->data, 6); // 6 first data bytes
+      frame->len = 8;
+      remainingDataBytes -= 6;
+    }
+    else // further frames
+    {
+      if (remainingDataBytes > 7)
+      {
+        memcpy(frame->buf + 1, msg->data + 6 + (index - 1) * 7, 7); // 7 next data bytes
+        frame->len = 8;
+        remainingDataBytes -= 7;
+      }
+      else
+      {
+        memcpy(frame->buf + 1, msg->data + 6 + (index - 1) * 7, remainingDataBytes); // 7 next data bytes
+        frame->len     = 1 + remainingDataBytes;
+        remainingDataBytes = 0;
+      }
+    }
+    simulator_send_frame(frame, socket);
+    index++;
+  }
+}
+
+bool simulator_data_write(char* data, int len) {
+  unsigned char  msg[500] = {0};
+  unsigned char *m;
+  char* cmd = data;
+
+  unsigned int prio;
+  unsigned int pgn;
+  unsigned int src = 0;
+  unsigned int dst = 255;
+  unsigned int bytes;
+
+  char        *p;
+  int          i;
+  int          b;
+  unsigned int byt;
+  int          r;
+  uint64_t     when = 0;
+
+  if (!cmd || !*cmd || *cmd == '\n')
+  {
+    return false;
+  }
+
+  parseTimestamp(cmd, &when);
+  p = strchr(cmd, ',');
+  if (!p)
+  {
+    return false;
+  }
+
+  r = sscanf(p, ",%u,%u,%u,%u,%u,%n", &prio, &pgn, &src, &dst, &bytes, &i);
+  logDebug("simulator_data_write %.20s = %d\n", p, r);
+  if (r == 5)
+  {
+    if (pgn >= ACTISENSE_BEM)
+    { // Ignore synthetic CANboat PGNs that report original device status.
+      return false;
+    }
+
+    p += i - 1;
+    m    = msg;
+    *m++ = (unsigned char) prio;
+    *m++ = (unsigned char) pgn;
+    *m++ = (unsigned char) (pgn >> 8);
+    *m++ = (unsigned char) (pgn >> 16);
+    *m++ = (unsigned char) dst;
+    //*m++ = (unsigned char) 0;
+    *m++ = (unsigned char) bytes;
+    for (b = 0; m < msg + sizeof(msg) && b < bytes; b++)
+    {
+      if ((sscanf(p, ",%x%n", &byt, &i) == 1) && (byt < 256))
+      {
+        *m++ = byt;
+      }
+      else
+      {
+        logError("Unable to parse incoming message '%s' at offset %u\n", cmd, b);
+        return false;
+      }
+      p += i;
+    }
+  }
+  else
+  {
+    logError("Unable to parse incoming message '%s', r = %d\n", cmd, r);
+    return false;
+  }
+
+  logDebug("About to write:  %s\n", cmd);
+
+  stEthCanFrame send_frame = {0};
+  send_frame.validCheck1 = 0xaaaaaaaa;
+  send_frame.validCheck2 = 0xaaaaaaaa;
+  send_frame.id = getCanIdFromISO11783Bits(prio, pgn, src, dst);
+  
+  PgnSendType pgn_type = judge_pgn_type(pgn);
+  if(pgn_type == Single) {
+    send_frame.len = bytes;
+    memcpy(send_frame.buf, msg+6, min(sizeof(send_frame.buf), bytes));
+    simulator_send_frame(&send_frame, simulator_socket);
+  } else if (pgn_type == Fast) {
+    RawMessage raw_msg = {0};
+    raw_msg.prio = prio;
+    raw_msg.pgn = pgn;
+    raw_msg.src = src;
+    raw_msg.dst = dst;
+    raw_msg.len = bytes;
+    // raw_msg.timestamp
+    memcpy(raw_msg.data, msg+6, min(sizeof(raw_msg.data), bytes));
+    simulator_send_fast_packet(&raw_msg, &send_frame, simulator_socket);
+  } else {
+    logError("Unable to parse incoming message '%s', pgn_type = %d\n", cmd, pgn_type);
+  }
+  return true;
+}
+
+bool insert_simulator_buffer(const uint8_t* data, uint32_t len) {
+  if(len <= 0) return false;
+  sbAppendData(&inBuffer, data, len);
+}
+
+bool get_sentence_from_simulator_buffer(uint8_t* out_data, int in_len, uint32_t* out_len) {
+  const char* p, *p_end;
+  size_t len;
+  p = find_substr(sbGet(&inBuffer), inBuffer.len, "\x10\x02", 2);
+  if (!p)
+  {
+    return false;
+  }
+  len = p - sbGet(&inBuffer);
+  if (p != sbGet(&inBuffer)) {
+    sbDelete(&inBuffer, 0, len);
+  }
+  p_end = find_substr(sbGet(&inBuffer), inBuffer.len, "\x10\x03", 2);
+  if (!p_end)
+  {
+    return false;
+  }
+  len = p_end - sbGet(&inBuffer) + 2;
+  *out_len = len;
+  if(len > in_len) return false;
+  memcpy(out_data, sbGet(&inBuffer), len);
+  sbDelete(&inBuffer, 0, len);
+
+  logDebug("getInMsg => '%s'\n", bytes_to_hex((const char*)out_data, len));
+  return true;
+}
+
+enum MSG_State
+{
+  MSG_START,
+  MSG_ESCAPE,
+  MSG_HEADER,
+  MSG_MESSAGE
+};
+
+
+static void n2kMessageReceived(const unsigned char *msg, size_t msgLen, const unsigned char command)
+{
+  unsigned int prio, src, dst;
+  unsigned int pgn;
+  size_t       i;
+  unsigned int len;
+  char         line[800] = {0};
+  char        *p;
+  char         dateStr[DATE_LENGTH] = {0};
+  size_t       headerLen = (command == N2K_MSG_SEND) ? 6 : 11;
+
+  if (msgLen < headerLen)
+  {
+    logError("Ignoring N2K message - too short\n");
+    return;
+  }
+  prio = msg[0];
+  pgn  = (unsigned int) msg[1] + 256 * ((unsigned int) msg[2] + 256 * (unsigned int) msg[3]);
+  dst  = msg[4];
+  if (command == N2K_MSG_SEND)
+  {
+    src = 0;
+    len = msg[5];
+  }
+  else
+  {
+    src = msg[5];
+    /* Skip the timestamp logged by the NGT-1-A in bytes 6-9 */
+    len = msg[10];
+  }
+
+  if (len > 223)
+  {
+    logError("Ignoring N2K message - too long (%u)\n", len);
+    return;
+  }
+
+  get_current_time_formatted(dateStr, sizeof(dateStr));
+  p = line;
+  snprintf(p, sizeof(line), "%s,%u,%u,%u,%u,%u", dateStr, prio, pgn, src, dst, len);
+  p += strlen(line);
+
+  i = headerLen;
+  len += i;
+  if (len > msgLen)
+  {
+    len = msgLen;
+  }
+  for (; i < len; i++)
+  {
+    snprintf(p, line + sizeof(line) - p, ",%02x", msg[i]);
+    p += strlen(p);
+  }
+
+  puts(line);
+  fflush(stdout);
+  simulator_data_write(line, p - line);
+}
+
+static void messageReceived(const unsigned char *msg, size_t msgLen)
+{
+  unsigned char command;
+  unsigned char checksum = 0;
+  unsigned char payloadLen;
+  size_t        i;
+
+  if (msgLen < 3)
+  {
+    logError("Ignore short command len = %zu\n", msgLen);
+    return;
+  }
+
+  for (i = 0; i < msgLen; i++)
+  {
+    checksum += msg[i];
+  }
+  if (checksum)
+  {
+    logError("Ignoring message with invalid checksum\n");
+    return;
+  }
+
+  command    = msg[0];
+  payloadLen = msg[1];
+
+  logDebug("message command = %02x len = %u\n", command, payloadLen);
+
+  if (command == N2K_MSG_RECEIVED || (isFile && command == N2K_MSG_SEND))
+  {
+    n2kMessageReceived(msg + 2, payloadLen, command);
+  }
+  else if (command == NGT_MSG_RECEIVED)
+  {
+    // ngtMessageReceived(msg + 2, payloadLen);
+    logError("TODO: handle NGT\n");
+  }
+}
+
+static bool readNGT1Byte(unsigned char c)
+{
+  static enum MSG_State prev_state = MSG_MESSAGE;
+  static enum MSG_State state      = MSG_START;
+  static bool           noEscape   = false;
+  static unsigned char  buf[500];
+  static unsigned char *head = buf;
+
+  logDebug("readNGT1Byte isFile=%d isEBL=%d state=%d c=0x%02x\n", isFile, isEBL, state, c);
+
+  if (state == MSG_START && isFile && !isEBL && c == ESC)
+  {
+    noEscape = true;
+  }
+
+  if (state == MSG_ESCAPE)
+  {
+    if (c == SOH && isEBL)
+    {
+      head  = buf;
+      state = MSG_HEADER;
+    }
+    else if (c == LF && isEBL)
+    {
+      // headerReceived(buf, head - buf);
+      logError("TODO: handle EBL\n");
+      head  = buf;
+      state = MSG_START;
+    }
+    else if (c == ETX)
+    {
+      messageReceived(buf, head - buf);
+      head  = buf;
+      state = MSG_START;
+    }
+    else if (c == STX)
+    {
+      head  = buf;
+      state = MSG_MESSAGE;
+    }
+    else if ((c == DLE) || ((c == ESC) && isFile) || noEscape)
+    {
+      if (head < buf + sizeof(buf))
+      {
+        *head++ = c;
+      }
+      state = prev_state;
+    }
+    else
+    {
+      logError("DLE followed by unexpected char %02X, ignore message\n", c);
+      state = MSG_START;
+    }
+  }
+  else if (state == MSG_MESSAGE)
+  {
+    if (c == DLE || (isFile && (c == ESC) && !noEscape))
+    {
+      prev_state = state;
+      state      = MSG_ESCAPE;
+    }
+    else if (head < buf + sizeof(buf))
+    {
+      *head++ = c;
+    }
+  }
+  else if (state == MSG_HEADER)
+  {
+    if (c == ESC)
+    {
+      prev_state = state;
+      state      = MSG_ESCAPE;
+    }
+    else if (head < buf + sizeof(buf))
+    {
+      *head++ = c;
+    }
+  }
+  else
+  {
+    if (c == DLE || (isFile && (c == ESC) && !noEscape))
+    {
+      prev_state = state;
+      state      = MSG_ESCAPE;
+    }
+  }
+
+  return state == MSG_START;
+}
+
+void handle_one_sentence(const uint8_t* data, uint32_t len) {
+  unsigned char c;
+  bool          finish;
+  if(len <= 4) return;
+  for (uint32_t i = 0; i < len; i++)
+  {
+    c      = data[i];
+    finish = readNGT1Byte(c);
+  }
+  if(!finish) {
+    logError("handle_one_sentence error with msg: %s\n", bytes_to_hex((const char*)data, len));
+  }
+  // n2kMessageReceived(data + 4, len, data[2]);
+}
 // load config, format:
 // READ,COM4,4800,9999
 // WRITE,COM22,4800,8888
@@ -951,13 +1378,6 @@ bool simulator_prepare() {
   return true;
 }
 
-// bool simulator_data_write(void* data, int len, int timeOutMs) {
-//   fd_set   s_set;
-//   int      ret;
-//   struct timeval  tv = { 0, timeOutMs * 1000 };
-//   FD_ZERO(&s_set);
-//   FD_SET(sockForTx, &s_set);
-// }
 
 int main(int argc, char **argv) {
     printf("hello, load config from config.txt\n");
@@ -1058,10 +1478,18 @@ int main(int argc, char **argv) {
         
         case WAIT_OBJECT_0 + 1:
           DWORD bytesRead;
+          unsigned char sentence_buf[1024];
+          uint32_t sentence_len = 0;
           GetOverlappedResult(simulator_handle, &ov, &bytesRead, TRUE);
           // handle serial data
           if (bytesRead > 0) {
             printf("simulator data: %s\n", comBuf);
+            insert_simulator_buffer((const uint8_t *)comBuf, bytesRead);
+            if(get_sentence_from_simulator_buffer(
+              sentence_buf, sizeof(sentence_buf), &sentence_len)
+            ) {
+              handle_one_sentence(sentence_buf, sentence_len);
+            }
           }
           memset(comBuf, 0, sizeof(comBuf));
           ReadFile(simulator_handle, comBuf, sizeof(comBuf), NULL, &ov);
@@ -1084,11 +1512,12 @@ int main(int argc, char **argv) {
         // printf("from %s:%d: len=%d\n", inet_ntoa(dst_addr.sin_addr), ntohs(dst_addr.sin_port), n);
         // handle_one_frame(reader_handle, (const unsigned char *)buf, n);
     }
-
+    sbDelete(&inBuffer, 0, inBuffer.len);
     SOCKET_CLOSE(reader_socket);
     close_serial(reader_handle);
     SOCKET_CLOSE(simulator_socket);
     close_serial(simulator_handle);
+    WSACleanup();
     printf("bye\n");
 
     return 0;
