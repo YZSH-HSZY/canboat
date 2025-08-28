@@ -67,6 +67,9 @@ BOOL WINAPI global_clear(DWORD signal) {
 #endif  // WIN32
 
 #ifdef _WIN32
+/*
+* @param: biStopBits 0,1,2 = 1, 1.5, 2 
+*/
 HANDLE open_serial(LPTSTR pzName, DWORD dwBaudRate, BYTE biDataBits, BYTE biStopBits, BYTE biParity) {
   HANDLE hUART;
 	DCB	dcb;
@@ -1338,7 +1341,7 @@ bool reader_prepare() {
       ERROR_PRINT("socket failed with error");
       return false;
   }
-  reader_handle = open_serial(VIRTUAL_PAIR_READER_COM_NAME, VIRTUAL_PAIR_READER_COM_BAUD, 8, 1, 0);
+  reader_handle = open_serial(VIRTUAL_PAIR_READER_COM_NAME, VIRTUAL_PAIR_READER_COM_BAUD, 8, 0, 0);
   if (reader_handle == INVALID_HANDLE_VALUE) {
       ERROR_PRINT("open_serial failed");
       SOCKET_CLOSE(reader_socket);
@@ -1364,7 +1367,7 @@ bool simulator_prepare() {
       ERROR_PRINT("socket failed with error");
       return false;
   }
-  simulator_handle = open_serial(VIRTUAL_PAIR_SIMULATOR_COM_NAME, VIRTUAL_PAIR_SIMULATOR_COM_BAUD, 8, 1, 0);
+  simulator_handle = open_serial(VIRTUAL_PAIR_SIMULATOR_COM_NAME, VIRTUAL_PAIR_SIMULATOR_COM_BAUD, 8, 0, 0);
   if (simulator_handle == INVALID_HANDLE_VALUE) {
       ERROR_PRINT("open_serial failed\n");
       SOCKET_CLOSE(simulator_socket);
@@ -1483,7 +1486,7 @@ int main(int argc, char **argv) {
           GetOverlappedResult(simulator_handle, &ov, &bytesRead, TRUE);
           // handle serial data
           if (bytesRead > 0) {
-            printf("simulator data: %s\n", comBuf);
+            printf("simulator data: %s\n", bytes_to_hex(comBuf, bytesRead));
             insert_simulator_buffer((const uint8_t *)comBuf, bytesRead);
             if(get_sentence_from_simulator_buffer(
               sentence_buf, sizeof(sentence_buf), &sentence_len)
